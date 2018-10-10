@@ -140,6 +140,7 @@ class BasicAttn(object):
         self.key_vec_size = key_vec_size
         self.value_vec_size = value_vec_size
 
+    ''' Does question have mask here? '''
     def build_graph(self, values, values_mask, keys):
         """
         Keys attend to values.
@@ -174,6 +175,72 @@ class BasicAttn(object):
             output = tf.nn.dropout(output, self.keep_prob)
 
             return attn_dist, output
+
+
+class BidirectionalAttn(object):
+    def __init__(self, keep_prob):
+        """
+        Inputs:
+          keep_prob: tensor containing a single scalar that is the keep probability (for dropout)
+          key_vec_size: size of the key vectors. int
+          value_vec_size: size of the value vectors. int
+        """
+        self.keep_prob = keep_prob
+
+    def build_graph(self, question_embeding_vecs, question_masks, context_embedding_vecs, context_masks):
+        """
+        Keys attend to values.
+        For each key, return an attention distribution and an attention output vector.
+
+        Inputs:
+          question_embeding_vecs: Tensor shape (batch_size, num_questions, value_vec_size).
+          question_masks: Tensor shape (batch_size, num_questions).
+            1s where there's real input, 0s where there's padding
+          context_embedding_vecs: Tensor shape (batch_size, num_contexts, value_vec_size)
+          context_masks: Tensor shape (batch_size, num_contexts).
+
+        Intermediate variables:
+          similarity_matrix: Tensor shape (batch_size, num_contexts, num_questions)
+          element_dot_product_matrix: The matrix of CQ = c_i \dot q_j. Tensor shape (batch_size, num_contexts, num_questions, value_vec_size)
+          {w_sim}^T (c_i; q_j; c_i \dot q_j)
+          So we need to expand C and Q to the same size of CQ.
+
+        Outputs:
+          attn_dist: Tensor shape (batch_size, num_keys, num_values).
+            For each key, the distribution should sum to 1,
+            and should be 0 in the value locations that correspond to padding.
+          output: Tensor shape (batch_size, num_keys, hidden_size).
+            This is the attention output; the weighted sum of the values
+            (using the attention distribution as weights).
+        """
+        with vs.variable_scope("BidirectionalAttn"):
+            # Calculate attention distribution
+            tiled_c = tf.tile(tf.expand_dims(context_embedding_vecs, 2), [1, 1, tf.shape(question_embeding_vecs)[1], 1])
+            tiled_q = tf.tile(tf.expand_dims(question_embeding_vecs, 1), [1, tf.shape(context_embedding_vecs)[1], 1, 1])
+            concated_matrix = tf.concat([tiled_c, tiled_q, tiled_c * tiled_q], axis=3)
+            logits = tf.contrib.layers.fully_connected(concated_matrix, num_outputs=1, activation_fn=None)
+            similarity_matrix = tf.squeeze(logits, axis=[3])  # Tensor shape (batch_size, num_contexts, num_questions)
+
+            # Calculate c2q attention
+            attn_logits_mask = tf.expand_dims(question_masks, 1)  # shape (batch_size, 1, num_questions)
+            # shape (batch_size, num_contexts, num_questions). take softmax over values
+            _, c2q_attn_dist = masked_softmax(similarity_matrix, attn_logits_mask, 2)
+            # Tensor shape (batch_size, num_contexts, value_vec_size)
+            c2q_attn_output = tf.matmul(c2q_attn_dist, question_embeding_vecs)
+
+            # Calculate q2c attention
+            sim_matrix_max = tf.reduce_max(similarity_matrix, axis=2)  # Tensor shape (batch_size, num_contexts)
+            # Tensor shape (batch_size, num_contexts)
+            _, q2c_attn_dist = masked_softmax(sim_matrix_max, context_masks, 1)
+            # Tensor shape (batch_size, 1, value_vec_size)
+            q2c_attn_output = tf.matmul(tf.expand_dims(q2c_attn_dist, 1), context_embedding_vecs)
+
+            output = tf.concat([context_embedding_vecs, c2q_attn_output, context_embedding_vecs * c2q_attn_output,
+                                context_embedding_vecs * q2c_attn_output], axis=2)
+            # Apply dropout
+            output = tf.nn.dropout(output, self.keep_prob)
+
+            return output
 
 
 def masked_softmax(logits, mask, dim):
