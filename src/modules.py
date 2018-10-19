@@ -178,7 +178,7 @@ class BasicAttn(object):
 
 
 class BidirectionalAttn(object):
-    def __init__(self, keep_prob):
+    def __init__(self, keep_prob, hidden_vec_size):
         """
         Inputs:
           keep_prob: tensor containing a single scalar that is the keep probability (for dropout)
@@ -186,6 +186,7 @@ class BidirectionalAttn(object):
           value_vec_size: size of the value vectors. int
         """
         self.keep_prob = keep_prob
+        self.hidden_vec_size = hidden_vec_size
 
     def build_graph(self, question_embeding_vecs, question_masks, context_embedding_vecs, context_masks):
         """
@@ -218,7 +219,11 @@ class BidirectionalAttn(object):
             tiled_c = tf.tile(tf.expand_dims(context_embedding_vecs, 2), [1, 1, tf.shape(question_embeding_vecs)[1], 1])
             tiled_q = tf.tile(tf.expand_dims(question_embeding_vecs, 1), [1, tf.shape(context_embedding_vecs)[1], 1, 1])
             concated_matrix = tf.concat([tiled_c, tiled_q, tiled_c * tiled_q], axis=3)
+
             logits = tf.contrib.layers.fully_connected(concated_matrix, num_outputs=1, activation_fn=None)
+            # weight_sim = tf.get_variable("weight_sim", shape=[3 * self.hidden_vec_size, 1])
+            # logits = tf.matmul(tf.reshape(concated_matrix, [-1, 3 * self.hidden_vec_size]), weight_sim)
+            # similarity_matrix = tf.reshape(logits, tf.shape(concated_matrix)[:-1])
             similarity_matrix = tf.squeeze(logits, axis=[3])  # Tensor shape (batch_size, num_contexts, num_questions)
 
             # Calculate c2q attention
@@ -241,6 +246,86 @@ class BidirectionalAttn(object):
             output = tf.nn.dropout(output, self.keep_prob)
 
             return output
+
+
+class CoAttention(object):
+    def __init__(self, keep_prob, hidden_vec_size):
+        """
+        Inputs:
+          keep_prob: tensor containing a single scalar that is the keep probability (for dropout)
+          key_vec_size: size of the key vectors. int
+          value_vec_size: size of the value vectors. int
+        """
+        self.keep_prob = keep_prob
+        self.hidden_vec_size = hidden_vec_size
+
+    def build_graph(self, question_embeding_vecs, question_masks, context_embedding_vecs, context_masks):
+        """
+        Keys attend to values.
+        For each key, return an attention distribution and an attention output vector.
+
+        Inputs:
+          question_embeding_vecs: Tensor shape (batch_size, num_questions, value_vec_size).
+          question_masks: Tensor shape (batch_size, num_questions).
+            1s where there's real input, 0s where there's padding
+          context_embedding_vecs: Tensor shape (batch_size, num_contexts, value_vec_size)
+          context_masks: Tensor shape (batch_size, num_contexts).
+
+        Intermediate variables:
+          similarity_matrix: Tensor shape (batch_size, num_contexts, num_questions)
+          element_dot_product_matrix: The matrix of CQ = c_i \dot q_j. Tensor shape (batch_size, num_contexts, num_questions, value_vec_size)
+          {w_sim}^T (c_i; q_j; c_i \dot q_j)
+          So we need to expand C and Q to the same size of CQ.
+
+        Outputs:
+          attn_dist: Tensor shape (batch_size, num_keys, num_values).
+            For each key, the distribution should sum to 1,
+            and should be 0 in the value locations that correspond to padding.
+          output: Tensor shape (batch_size, num_keys, hidden_size).
+            This is the attention output; the weighted sum of the values
+            (using the attention distribution as weights).
+        """
+        with vs.variable_scope("CoAttention"):
+            transformed_question_vecs = tf.contrib.layers.\
+                fully_connected(question_embeding_vecs, num_outputs=self.hidden_vec_size, activation_fn=tf.tanh)
+            sentinel_c = tf.get_variable("sentinel_c", shape=[1, self.hidden_vec_size])
+            sentinel_q = tf.get_variable("sentinel_q", shape=[1, self.hidden_vec_size])
+            # tensor shape: [ batch_size, N+1, l ]
+            context_entended_vec = tf.concat([context_embedding_vecs, tf.tile(tf.expand_dims(sentinel_c, 0),
+                                              [tf.shape(question_embeding_vecs)[0], 1, 1])], axis=1)
+            # tensor shape: [ batch_size, M+1, l ]
+            question_entended_vec = tf.concat([transformed_question_vecs, tf.tile(tf.expand_dims(sentinel_q, 0),
+                                              [tf.shape(question_embeding_vecs)[0], 1, 1])], axis=1)
+            # tensor shape: [ batch_size, N+1, M+1]
+            affinity_mat = tf.matmul(context_entended_vec, tf.transpose(question_entended_vec, perm=[0, 2, 1]))
+
+            # Create a (batch_size, 1) vector
+            #mask_extend_placeholder = tf.placeholder(tf.int32, shape=(tf.shape(question_embeding_vecs)[0], 1))
+            t = tf.fill([tf.shape(question_embeding_vecs)[0], 1], 1)
+
+            # shape (batch_size, 1, M+1)
+            attn_question_masks = tf.expand_dims(
+                tf.concat([question_masks, t], axis=1), 1)
+            # shape (batch_size, N+1, M+1). take softmax over column axis
+            _, alpha_dist = masked_softmax(affinity_mat, attn_question_masks, 2)
+            # tensor shape: (batch_size, N+1, l)
+            c2q_attn_outputs = tf.matmul(alpha_dist, question_entended_vec)
+
+            # shape (batch_size, N+1, 1)
+            attn_context_masks = tf.expand_dims(
+                tf.concat([context_masks, t], axis=1), 2)
+            # shape (batch_size, N+1, M+1). take softmax over row axis
+            _, beta_dist = masked_softmax(affinity_mat, attn_context_masks, 1)
+            # tensor shape: (batch_size, M+1, l)
+            q2c_attn_outputs = tf.matmul(tf.transpose(beta_dist, perm=[0, 2, 1]), context_entended_vec)
+            attn_2nd_lv = tf.matmul(alpha_dist, q2c_attn_outputs)  # tensor shape: (batch_size, N+1, l)
+
+            concated_vec = tf.concat([attn_2nd_lv, c2q_attn_outputs], axis=2)
+            trancated_concated_vec = concated_vec[:, :-1, :]
+            encoder = RNNEncoder(2 * self.hidden_vec_size, self.keep_prob)
+            # (batch_size, context_len, hidden_size*4)
+            bi_gru_output = encoder.build_graph(trancated_concated_vec, context_masks)
+            return bi_gru_output
 
 
 def masked_softmax(logits, mask, dim):
